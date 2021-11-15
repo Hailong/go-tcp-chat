@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"strings"
 )
@@ -22,6 +24,12 @@ var (
 )
 
 func main() {
+	go func() {
+		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+			log.Fatalf("Pprof failed: %v", err)
+		}
+	}()
+
 	ln, err := net.Listen("tcp", ":8000")
 	logFatal(err)
 
@@ -40,6 +48,7 @@ func main() {
 	for {
 		select {
 		case conn := <-newConnection:
+			// fmt.Println("Connections:", len(openConnections))
 			go broadcastMessage(conn)
 		case conn := <-deadConnection:
 			for item := range openConnections {
