@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/gobwas/ws/wsutil"
 	"golang.org/x/sys/unix"
 )
 
@@ -25,6 +26,8 @@ var (
 	deadConnection  = make(chan net.Conn)
 )
 
+var epoller *epoll
+
 func main() {
 	go func() {
 		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
@@ -32,90 +35,46 @@ func main() {
 		}
 	}()
 
-	var (
-		// == SERVER ==
-		PORT = 8000
-		ADDR = [4]byte{127, 0, 0, 1}
-		// ============
-		LISTENBACKLOG = 100
-		MAXMSGSIZE    = 8000
-	)
-
-	serverFD, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, unix.IPPROTO_IP)
+	// start epoll
+	var err error
+	epoller, err = MkEpoll()
 	logFatal(err)
 
-	serverAddr := &unix.SockaddrInet4{
-		Port: PORT,
-		Addr: ADDR,
-	}
+	go Start()
 
-	err = unix.Bind(serverFD, serverAddr)
+	ln, err := net.Listen("tcp", ":8000")
 	logFatal(err)
-
-	fmt.Printf("Server: Bound to addr: %d, port: %d\n", serverAddr.Addr, serverAddr.Port)
-
-	err = unix.Listen(serverFD, LISTENBACKLOG)
-	logFatal(err)
-
-	var activeFdSet unix.FdSet
-	var tmpFdSet unix.FdSet
-	var fdMax int
-	FDZero(&activeFdSet)
-	FDSet(serverFD, &activeFdSet)
-	fdMax = serverFD
-
-	fdAddr := FDAddrInit()
 
 	for {
-		tmpFdSet = activeFdSet
-
-		_, err := unix.Select(fdMax+1, &tmpFdSet, nil, nil, nil)
+		conn, err := ln.Accept()
 		logFatal(err)
 
-		for fd := 0; fd < fdMax+1; fd++ {
-			if FDIsSet(fd, &tmpFdSet) {
-				if fd == serverFD {
-					acceptedFD, acceptedAddr, err := unix.Accept(serverFD)
-					logFatal(err)
+		if err := epoller.Add(conn); err != nil {
+			log.Printf("Failed to add connection")
+			conn.Close()
+		}
+	}
+}
 
-					FDSet(acceptedFD, &activeFdSet)
-					fdAddr.Set(acceptedFD, acceptedAddr)
-					if acceptedFD > fdMax {
-						fdMax = acceptedFD
-					}
-				} else {
-					msg := make([]byte, MAXMSGSIZE)
-
-					sizeMsg, _, err := unix.Recvfrom(fd, msg, 0)
-
-					if err != nil {
-						fmt.Println("Recvfrom: ", err)
-						FDClr(fd, &activeFdSet)
-						unix.Close(fd)
-						fdAddr.Clr(fd)
-						continue
-					}
-
-					clientAddr := fdAddr.Get(fd)
-					addrFrom := clientAddr.(*unix.SockaddrInet4)
-					fmt.Printf("%d byte read from %d:%d on socket %d\n",
-						sizeMsg, addrFrom.Addr, addrFrom.Port, fd)
-					print("> Received message:\n" + string(msg) + "\n")
-					response := []byte("We just received your message: " + string(msg))
-
-					err = unix.Sendmsg(
-						fd,
-						response,
-						nil, clientAddr, unix.MSG_DONTWAIT,
-					)
-					logFatal(err)
-
-					print("< Response message:\n" + string(response) + "\n")
-
-					FDClr(fd, &activeFdSet)
-					fdAddr.Clr(fd)
-					unix.Close(fd)
+func Start() {
+	for {
+		connections, err := epoller.Wait()
+		if err != nil {
+			log.Printf("Failed to epoll wait %v", err)
+			continue
+		}
+		for _, conn := range connections {
+			if conn == nil {
+				break
+			}
+			if msg, _, err := wsutil.ReadClientData(conn); err != nil {
+				if err := epoller.Remove(conn); err != nil {
+					log.Printf("Failed to remove %v", err)
 				}
+				conn.Close()
+			} else {
+				// This is commented out since in demo usage, stdout is showing messages sent from > 1M connections at very high rate
+				log.Printf("msg: %s", string(msg))
 			}
 		}
 	}
